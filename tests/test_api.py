@@ -207,7 +207,30 @@ class TestAPISchemasValidation(unittest.TestCase):
         )
         self.assertTrue(resp.success)
         self.assertEqual(resp.indices.ndvi.mean, 0.2468)
+        self.assertEqual(resp.indices.ndvi_mean, 0.2468)
+        self.assertEqual(resp.indices.ndvi_min, -0.4462)
+        self.assertEqual(resp.indices.ndvi_max, 0.6649)
+        self.assertEqual(resp.indices.ndwi.mean, -0.2574)
+        self.assertEqual(resp.indices.ndwi_mean, -0.2574)
+        self.assertEqual(resp.indices.ndwi_min, -0.6008)
+        self.assertEqual(resp.indices.ndwi_max, 0.4673)
         self.assertTrue(resp.outputs.ndvi_raster_url.startswith("/files/satellite/"))
+
+    def test_satellite_indices_scalar_instantiation(self):
+        indices = SatelliteIndices(
+            ndvi_mean=0.35,
+            ndvi_min=-0.1,
+            ndvi_max=0.8,
+            ndwi_mean=-0.2,
+            ndwi_min=-0.5,
+            ndwi_max=0.3,
+        )
+        self.assertEqual(indices.ndvi.mean, 0.35)
+        self.assertEqual(indices.ndvi.min, -0.1)
+        self.assertEqual(indices.ndvi.max, 0.8)
+        self.assertEqual(indices.ndwi.mean, -0.2)
+        self.assertEqual(indices.ndwi.min, -0.5)
+        self.assertEqual(indices.ndwi.max, 0.3)
 
     def test_satellite_analyze_invalid_cloud_cover(self):
         with self.assertRaises(ValidationError):
@@ -612,6 +635,31 @@ class TestSatelliteAnalyzeEndpoint(unittest.TestCase):
             self.assertIn("indices", data)
             self.assertIn("ndvi", data["indices"])
             self.assertIn("ndwi", data["indices"])
+
+            # Verify scalar summary values in indices
+            indices = data["indices"]
+            self.assertIn("ndvi_mean", indices)
+            self.assertIn("ndvi_min", indices)
+            self.assertIn("ndvi_max", indices)
+            self.assertIn("ndwi_mean", indices)
+            self.assertIn("ndwi_min", indices)
+            self.assertIn("ndwi_max", indices)
+
+            self.assertIsInstance(indices["ndvi_mean"], float)
+            self.assertIsInstance(indices["ndvi_min"], float)
+            self.assertIsInstance(indices["ndvi_max"], float)
+            self.assertIsInstance(indices["ndwi_mean"], float)
+            self.assertIsInstance(indices["ndwi_min"], float)
+            self.assertIsInstance(indices["ndwi_max"], float)
+
+            # Consistency between scalar fields and nested object fields
+            self.assertAlmostEqual(indices["ndvi_mean"], indices["ndvi"]["mean"])
+            self.assertAlmostEqual(indices["ndvi_min"], indices["ndvi"]["min"])
+            self.assertAlmostEqual(indices["ndvi_max"], indices["ndvi"]["max"])
+            self.assertAlmostEqual(indices["ndwi_mean"], indices["ndwi"]["mean"])
+            self.assertAlmostEqual(indices["ndwi_min"], indices["ndwi"]["min"])
+            self.assertAlmostEqual(indices["ndwi_max"], indices["ndwi"]["max"])
+
             self.assertIn("outputs", data)
             self.assertIn("processing_time_ms", data)
             self.assertGreater(data["processing_time_ms"], 0.0)

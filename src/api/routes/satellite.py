@@ -42,6 +42,12 @@ from src.satellite.temporal_change import (
     write_temporal_change_geotiff,
     write_temporal_change_summary,
 )
+from src.satellite.sentinelhub_client import (
+    SentinelHubClient,
+    SentinelHubConfig,
+    SentinelHubError,
+    get_sentinelhub_client,
+)
 from src.api.schemas import (
     SatelliteAnalyzeRequest,
     SatelliteAnalyzeResponse,
@@ -128,6 +134,34 @@ def execute_satellite_raster_pipeline(
     # 2. NDWI Calculation & Statistics
     ndwi = calculate_ndwi(band_primary=b03_data, band_secondary=b08_data)
     ndwi_stats = compute_ndwi_statistics(ndwi)
+
+    # Ensure authentic scalar summary statistics computed from generated rasters
+    def _extract_summary_stats(stats: Dict[str, Any], raster: np.ndarray) -> Dict[str, Any]:
+        mean_val = stats.get("mean")
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+        std_val = stats.get("std")
+
+        if mean_val is None or min_val is None or max_val is None:
+            valid_cells = raster[np.isfinite(raster) & (raster != -9999.0)]
+            if valid_cells.size == 0:
+                finite_cells = raster[np.isfinite(raster)]
+                valid_cells = finite_cells if finite_cells.size > 0 else np.array([0.0], dtype=np.float32)
+
+            mean_val = round(float(np.mean(valid_cells)), 4)
+            min_val = round(float(np.min(valid_cells)), 4)
+            max_val = round(float(np.max(valid_cells)), 4)
+            std_val = round(float(np.std(valid_cells)), 4)
+        else:
+            mean_val = round(float(mean_val), 4)
+            min_val = round(float(min_val), 4)
+            max_val = round(float(max_val), 4)
+            std_val = round(float(std_val), 4) if std_val is not None else None
+
+        return {"mean": mean_val, "min": min_val, "max": max_val, "std": std_val}
+
+    ndvi_stats.update(_extract_summary_stats(ndvi_stats, ndvi))
+    ndwi_stats.update(_extract_summary_stats(ndwi_stats, ndwi))
 
     # 3. Water Mask Classification
     water_mask = classify_water_mask(ndwi)
@@ -216,24 +250,47 @@ async def analyze_satellite(req: SatelliteAnalyzeRequest):
     scene_datetime = best.get("datetime", "")
     cloud_cover = float(best.get("cloud_cover_pct", 0.0))
 
-    # 3. Check Asset Accessibility
-    local_bands = resolve_local_scene_bands(scene_id)
-    if local_bands is None:
-        # Truthful remote CDSE authentication governance
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"Sentinel-2 raw band assets for scene '{scene_id}' are inaccessible: "
-                "Copernicus Data Space Ecosystem (CDSE) requires registered user authentication "
-                "(OAuth2/OIDC) to download full-resolution bands."
-            ),
-        )
+    # 3. Check Asset Accessibility & Retrieve Band Arrays
+    b03, b04, b08, transform, crs = None, None, None, None, None
+    sh_client = get_sentinelhub_client()
+
+    if sh_client is not None:
+        # Remote Sentinel Hub Process API Flow
+        try:
+            b03, b04, b08, transform, crs = sh_client.fetch_bands_for_scene(
+                aoi_bbox=aoi.to_list(),
+                acquisition_datetime=scene_datetime,
+                max_cloud=max_cloud,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Sentinel Hub Process API remote retrieval failed: {str(exc)}",
+            )
+    else:
+        # Local JP2 development fallback
+        local_bands = resolve_local_scene_bands(scene_id)
+        if local_bands is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Sentinel-2 raw band assets for scene '{scene_id}' are inaccessible: "
+                    "Copernicus Data Space Ecosystem (CDSE) requires registered user authentication "
+                    "(OAuth2/OIDC) to download full-resolution bands. Set CDSE_CLIENT_ID and CDSE_CLIENT_SECRET "
+                    "environment variables to enable live Sentinel Hub Process API retrieval."
+                ),
+            )
+        try:
+            b03, b04, b08, transform, crs = load_band_arrays(local_bands)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Satellite raster loading failure: {str(e)}",
+            )
 
     # 4. Execute Raster Processing
     request_id = str(uuid.uuid4())
     try:
-        b03, b04, b08, transform, crs = load_band_arrays(local_bands)
-
         ndvi_stats, ndwi_stats, output_urls = execute_satellite_raster_pipeline(
             b03_data=b03,
             b04_data=b04,
@@ -270,17 +327,25 @@ async def analyze_satellite(req: SatelliteAnalyzeRequest):
         ),
         indices=SatelliteIndices(
             ndvi=RasterIndexStats(
-                mean=ndvi_stats["mean"],
-                min=ndvi_stats["min"],
-                max=ndvi_stats["max"],
-                std=ndvi_stats.get("std"),
+                mean=float(ndvi_stats["mean"]),
+                min=float(ndvi_stats["min"]),
+                max=float(ndvi_stats["max"]),
+                std=float(ndvi_stats["std"]) if ndvi_stats.get("std") is not None else None,
             ),
             ndwi=RasterIndexStats(
-                mean=ndwi_stats["mean"],
-                min=ndwi_stats["min"],
-                max=ndwi_stats["max"],
-                std=ndwi_stats.get("std"),
+                mean=float(ndwi_stats["mean"]),
+                min=float(ndwi_stats["min"]),
+                max=float(ndwi_stats["max"]),
+                std=float(ndwi_stats["std"]) if ndwi_stats.get("std") is not None else None,
             ),
+            ndvi_mean=float(ndvi_stats["mean"]),
+            ndvi_min=float(ndvi_stats["min"]),
+            ndvi_max=float(ndvi_stats["max"]),
+            ndvi_std=float(ndvi_stats["std"]) if ndvi_stats.get("std") is not None else None,
+            ndwi_mean=float(ndwi_stats["mean"]),
+            ndwi_min=float(ndwi_stats["min"]),
+            ndwi_max=float(ndwi_stats["max"]),
+            ndwi_std=float(ndwi_stats["std"]) if ndwi_stats.get("std") is not None else None,
         ),
         outputs=SatelliteAnalyzeOutputs(
             ndvi_raster_url=output_urls["ndvi_raster_url"],
@@ -415,30 +480,56 @@ async def detect_satellite_change(req: SatelliteChangeRequest):
     after_scene_id = after_best["scene_id"]
     after_date_str = after_best.get("datetime", "")[:10]
 
-    # 5. Check Asset Accessibility (CDSE Truthful Governance)
-    before_bands = resolve_local_scene_bands(before_scene_id)
-    after_bands = resolve_local_scene_bands(after_scene_id)
+    # 5. Check Asset Accessibility & Load Band Arrays
+    sh_client = get_sentinelhub_client()
+    b03_t0, b04_t0, b08_t0, transform_t0, crs_t0 = None, None, None, None, None
+    b03_t1, b04_t1, b08_t1, transform_t1, crs_t1 = None, None, None, None, None
 
-    if before_bands is None or after_bands is None:
-        missing_scene = before_scene_id if before_bands is None else after_scene_id
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"Sentinel-2 raw band assets for scene '{missing_scene}' are inaccessible: "
-                "Copernicus Data Space Ecosystem (CDSE) requires registered user authentication "
-                "(OAuth2/OIDC) to download full-resolution bands."
-            ),
-        )
+    if sh_client is not None:
+        # Remote Sentinel Hub Process API Flow for before and after observations
+        try:
+            target_dims = sh_client.calculate_dimensions(aoi.to_list())
+            b03_t0, b04_t0, b08_t0, transform_t0, crs_t0 = sh_client.fetch_bands_for_scene(
+                aoi_bbox=aoi.to_list(),
+                acquisition_datetime=before_best.get("datetime", ""),
+                fixed_dimensions=target_dims,
+            )
+            b03_t1, b04_t1, b08_t1, transform_t1, crs_t1 = sh_client.fetch_bands_for_scene(
+                aoi_bbox=aoi.to_list(),
+                acquisition_datetime=after_best.get("datetime", ""),
+                fixed_dimensions=target_dims,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Sentinel Hub Process API remote retrieval failed for temporal pair: {str(exc)}",
+            )
+    else:
+        # Local JP2 development fallback
+        before_bands = resolve_local_scene_bands(before_scene_id)
+        after_bands = resolve_local_scene_bands(after_scene_id)
 
-    # 6. Load Band Arrays and Validate Spatial Pair
-    try:
-        b03_t0, b04_t0, b08_t0, transform_t0, crs_t0 = load_band_arrays(before_bands)
-        b03_t1, b04_t1, b08_t1, transform_t1, crs_t1 = load_band_arrays(after_bands)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load Sentinel-2 multispectral band rasters: {str(e)}",
-        )
+        if before_bands is None or after_bands is None:
+            missing_scene = before_scene_id if before_bands is None else after_scene_id
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Sentinel-2 raw band assets for scene '{missing_scene}' are inaccessible: "
+                    "Copernicus Data Space Ecosystem (CDSE) requires registered user authentication "
+                    "(OAuth2/OIDC) to download full-resolution bands. Set CDSE_CLIENT_ID and CDSE_CLIENT_SECRET "
+                    "environment variables to enable live Sentinel Hub Process API retrieval."
+                ),
+            )
+
+        # 6. Load Band Arrays and Validate Spatial Pair
+        try:
+            b03_t0, b04_t0, b08_t0, transform_t0, crs_t0 = load_band_arrays(before_bands)
+            b03_t1, b04_t1, b08_t1, transform_t1, crs_t1 = load_band_arrays(after_bands)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to load Sentinel-2 multispectral band rasters: {str(e)}",
+            )
 
     # Spatial alignment verification
     h0, w0 = b04_t0.shape

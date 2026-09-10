@@ -155,8 +155,61 @@ class RasterIndexStats(BaseModel):
 
 class SatelliteIndices(BaseModel):
     """Vegetation and water index statistical summaries."""
-    ndvi: RasterIndexStats = Field(..., description="Normalized Difference Vegetation Index statistics")
-    ndwi: RasterIndexStats = Field(..., description="Normalized Difference Water Index statistics")
+    ndvi: Optional[RasterIndexStats] = Field(default=None, description="Normalized Difference Vegetation Index statistics")
+    ndwi: Optional[RasterIndexStats] = Field(default=None, description="Normalized Difference Water Index statistics")
+    ndvi_mean: Optional[float] = Field(default=None, description="Mean NDVI across valid raster cells")
+    ndvi_min: Optional[float] = Field(default=None, description="Minimum valid NDVI value")
+    ndvi_max: Optional[float] = Field(default=None, description="Maximum valid NDVI value")
+    ndvi_std: Optional[float] = Field(default=None, description="Standard deviation of NDVI values")
+    ndwi_mean: Optional[float] = Field(default=None, description="Mean NDWI across valid raster cells")
+    ndwi_min: Optional[float] = Field(default=None, description="Minimum valid NDWI value")
+    ndwi_max: Optional[float] = Field(default=None, description="Maximum valid NDWI value")
+    ndwi_std: Optional[float] = Field(default=None, description="Standard deviation of NDWI values")
+
+    @model_validator(mode="after")
+    def sync_scalar_and_object_stats(self):
+        """
+        Synchronizes scalar summary values with nested RasterIndexStats objects
+        to provide seamless backward compatibility and flat metric access.
+        """
+        if self.ndvi is not None:
+            if self.ndvi_mean is None and self.ndvi.mean is not None:
+                self.ndvi_mean = self.ndvi.mean
+            if self.ndvi_min is None and self.ndvi.min is not None:
+                self.ndvi_min = self.ndvi.min
+            if self.ndvi_max is None and self.ndvi.max is not None:
+                self.ndvi_max = self.ndvi.max
+            if self.ndvi_std is None and self.ndvi.std is not None:
+                self.ndvi_std = self.ndvi.std
+        elif self.ndvi_mean is not None and self.ndvi_min is not None and self.ndvi_max is not None:
+            self.ndvi = RasterIndexStats(
+                mean=self.ndvi_mean,
+                min=self.ndvi_min,
+                max=self.ndvi_max,
+                std=self.ndvi_std,
+            )
+
+        if self.ndwi is not None:
+            if self.ndwi_mean is None and self.ndwi.mean is not None:
+                self.ndwi_mean = self.ndwi.mean
+            if self.ndwi_min is None and self.ndwi.min is not None:
+                self.ndwi_min = self.ndwi.min
+            if self.ndwi_max is None and self.ndwi.max is not None:
+                self.ndwi_max = self.ndwi.max
+            if self.ndwi_std is None and self.ndwi.std is not None:
+                self.ndwi_std = self.ndwi.std
+        elif self.ndwi_mean is not None and self.ndwi_min is not None and self.ndwi_max is not None:
+            self.ndwi = RasterIndexStats(
+                mean=self.ndwi_mean,
+                min=self.ndwi_min,
+                max=self.ndwi_max,
+                std=self.ndwi_std,
+            )
+
+        if self.ndvi is None or self.ndwi is None:
+            raise ValueError("Both NDVI and NDWI metrics must be provided as objects or scalar summaries.")
+
+        return self
 
 
 class SatelliteAnalyzeOutputs(BaseModel):
